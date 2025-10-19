@@ -1,7 +1,9 @@
-# main.py (исправленный)
+# main.py (исправленный с распознаванием дефисов и тире)
 from aiogram import Bot, Dispatcher, Router
-from aiogram.types import Message, PollAnswer, BotCommandScopeAllPrivateChats, BotCommand
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from aiogram.types import (
+    Message, PollAnswer, BotCommandScopeAllPrivateChats,
+    BotCommand, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+)
 from aiogram.filters import Command, CommandStart
 from sql import init_db, get_words_for_user, add_word, delete_all_words
 from config import API_TOKEN
@@ -10,18 +12,17 @@ import logging
 import asyncio
 import fitz
 import re
-import json, urllib.parse
+import json
+import urllib.parse
 from aiogram import types
 
-# Более подробное логирование для отладки
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
+# ---------------- Логирование ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 router = Router()
-
-# НЕ вызывать include_router здесь — сначала объявляем все хэндлеры, потом подключаем роутер
 
 active_tests = {}
 current_polls = {}
@@ -31,334 +32,290 @@ stop_test_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[[InlineKeyboardButton(text="⛔️ Остановить тест", callback_data="stop_test")]]
 )
 
-# ---------------- handlers ----------------
-
+# ---------------- Команда /start ----------------
 @router.message(CommandStart())
 async def start_command(message: Message):
     await message.answer(
-        "Привет! Я ваш бот для изучения слов.\n"
-        "Мои команды:\n"
-        "- /add — добавить слова \n"
-        "- Образец: слово - перевод,  ...\n"
-        "- Можете отправить текстовый файл (txt),(pdf) для загрузки слов\n"
-        "- /list — чтобы узнать список слов\n"
+        "👋 Привет! Я бот для изучения слов.\n\n"
+        "📘 Команды:\n"
+        "- /add — добавить слова (пример: work - работа, mother-in-law - тёща)\n"
+        "- можно отправить файл .txt или .pdf с парами слов\n"
+        "- /list — список слов\n"
         "- /delete_all — удалить все слова\n"
-        "- /test — начать тестирование\n"
-        "- /swap_test — начать тестирование наоборот\n"
+        "- /test — тест (слово → перевод)\n"
+        "- /swap_test — обратный тест (перевод → слово)\n"
         "- /manual_test — ручной тест\n"
-        "- /game — запустить мини-игру с вашими словами"
+        "- /game — мини-игра 🎮"
     )
 
+# ---------------- Добавление слов ----------------
 @router.message(Command("add"))
 async def add_command(message: Message):
     user_id = message.from_user.id
     try:
         _, words_text = message.text.split(maxsplit=1)
-        word_pairs = [pair.strip().split('-', maxsplit=1) for pair in words_text.split(",")]
+
+        # Разделяем пары по запятым, но не ломаем дефисные слова
+        pairs = re.split(r',(?![^()]*\))', words_text)
+
         added_words = []
-        for pair in word_pairs:
-            if len(pair) == 2:
-                phrase, translation = pair
+        for pair in pairs:
+            pair = pair.strip()
+            if not pair:
+                continue
+
+            # 🧠 Разделяем только по тире, не по дефису внутри слова
+            parts = re.split(r'\s*[-–—]\s*', pair, maxsplit=1)
+
+            if len(parts) == 2:
+                phrase, translation = parts
                 phrase = phrase.strip()
                 translation = translation.strip()
                 if phrase and translation:
                     await add_word(phrase, translation, user_id)
                     added_words.append(f"{phrase} — {translation}")
-            else:
-                await message.answer(f"Ошибка в формате пары: {pair}. Используйте формат: словосочетание - перевод.")
-        if added_words:
-            await message.answer(f"Добавлены слова и словосочетания:\n" + "\n".join(added_words))
-    except ValueError:
-        await message.answer("Используйте формат: /add словосочетание1 - перевод1, ...")
-    except Exception as e:
-        logger.exception("Ошибка при add_command: %s", e)
-        await message.answer("Произошла ошибка при добавлении слов.")
 
+        if added_words:
+            await message.answer("✅ Добавлены слова:\n" + "\n".join(added_words))
+        else:
+            await message.answer("❌ Не найдено строк формата: слово - перевод.\n\n"
+                                 "ℹ️ Пример: `book - книга`, `mother-in-law - тёща`")
+
+    except Exception as e:
+        logger.exception("Ошибка при добавлении слов: %s", e)
+        await message.answer("⚠️ Произошла ошибка при добавлении слов.")
+
+# ---------------- Загрузка файлов ----------------
 @router.message(lambda message: message.document and message.document.file_name.lower().endswith(('.txt', '.pdf')))
 async def handle_file(message: Message):
     user_id = message.from_user.id
-    file_id = message.document.file_id
-    file = await bot.get_file(file_id)
+    file = await bot.get_file(message.document.file_id)
     file_path = file.file_path
     file_content = await bot.download_file(file_path)
 
     try:
         if message.document.file_name.lower().endswith('.txt'):
-            content = file_content.read().decode('utf-8')
-        elif message.document.file_name.lower().endswith('.pdf'):
+            content = file_content.read().decode('utf-8', errors='ignore')
+        else:
             with open("temp.pdf", "wb") as f:
                 f.write(file_content.read())
             doc = fitz.open("temp.pdf")
-            content = ""
-            for page in doc:
-                content += page.get_text()
+            content = "".join(page.get_text() for page in doc)
             doc.close()
-        else:
-            await message.answer("❌ Поддерживаются только .txt и .pdf файлы.")
-            return
 
-        lines = content.splitlines()
         added_words = []
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
 
-        for line in lines:
+            # 🧠 Основная логика: ищем тире, но не дефис
             parts = re.split(r'\s*[-–—]\s*', line, maxsplit=1)
+
             if len(parts) == 2:
-                phrase = parts[0].strip()
-                translation = parts[1].strip()
+                phrase, translation = parts
+                phrase = phrase.strip()
+                translation = translation.strip()
                 if phrase and translation:
                     await add_word(phrase, translation, user_id)
-                    added_words.append(f"{phrase} - {translation}")
+                    added_words.append(f"{phrase} — {translation}")
 
         if added_words:
-            await message.answer(f"✅ Добавлены слова:\n" + "\n".join(added_words))
+            await message.answer("✅ Добавлены слова:\n" + "\n".join(added_words[:50]))
         else:
-            await message.answer("❌ Файл не содержит строк в формате: <слово> - <перевод>")
+            await message.answer("❌ Не найдено строк формата: слово - перевод.\n"
+                                 "Проверь, чтобы тире было между словом и переводом, а не дефисом в слове.")
+
     except Exception as e:
         logger.exception("Ошибка обработки файла: %s", e)
-        await message.answer("⚠️ Ошибка при разборе файла. Проверьте формат.")
+        await message.answer("⚠️ Ошибка при обработке файла. Проверь формат.")
 
+# ---------------- Список слов ----------------
 @router.message(Command("list"))
 async def list_words(message: Message):
     user_id = message.from_user.id
-    try:
-        words = await get_words_for_user(user_id)
-        if not words:
-            await message.answer("Ваш список слов пока пуст. Вы можете добавить новые слова с помощью команды /add.")
-            return
-        word_list = "\n".join([f"{word} — {translation}" for word, translation in words])
-        for chunk in chunk_list(word_list.splitlines(), 50):
-            await message.answer("\n".join(chunk))
-    except Exception as e:
-        logger.exception("Ошибка при получении списка слов: %s", e)
-        await message.answer("Произошла ошибка при получении списка слов.")
-        
-@router.message(Command("delete_all"))
-async def delete_all_command(message: Message):
-    user_id = message.from_user.id
-    try:
-        await delete_all_words(user_id)
-        await message.answer("Все добавленные слова были успешно удалены!")
-    except Exception as e:
-        logger.exception("Ошибка при удалении всех слов: %s", e)
-        await message.answer("Произошла ошибка при удалении слов.")
+    words = await get_words_for_user(user_id)
+    if not words:
+        await message.answer("📭 Список слов пуст. Добавь их через /add.")
+        return
+    text = "\n".join([f"{w} — {t}" for w, t in words])
+    for chunk in chunk_list(text.splitlines(), 50):
+        await message.answer("\n".join(chunk))
 
 def chunk_list(lst, chunk_size):
     for i in range(0, len(lst), chunk_size):
         yield lst[i:i + chunk_size]
 
+# ---------------- Удаление слов ----------------
+@router.message(Command("delete_all"))
+async def delete_all_command(message: Message):
+    user_id = message.from_user.id
+    await delete_all_words(user_id)
+    await message.answer("🗑 Все слова удалены!")
 
-# ---------- GAME handler ----------
+# ---------------- GAME ----------------
 GITHUB_GAME_URL = "https://shahriyor20042004.github.io/Game/"
 
 @router.message(Command("game"))
 async def send_game(message: types.Message):
-    logger.info("Received /game from user_id=%s", message.from_user.id)
-    try:
-        user_id = message.from_user.id
+    user_id = message.from_user.id
+    words = await get_words_for_user(user_id)
 
-        # Получаем слова из БД
-        words = await get_words_for_user(user_id)
-        if not words:
-            await message.answer("У тебя пока нет слов. Добавь их командой /add.")
-            return
+    if not words:
+        await message.answer("❌ У тебя пока нет слов. Добавь их командой /add.")
+        return
 
-        # Ограничим количество слов
-        MAX_WORDS_IN_URL = 100
-        words = words[:MAX_WORDS_IN_URL]
+    # ✅ Берем случайные 30 слов, даже если у пользователя 500+
+    MAX_WORDS = 30
+    selected_words = random.sample(words, min(MAX_WORDS, len(words)))
 
-        words_list = [[w[0], w[1]] for w in words]
-        words_json = json.dumps(words_list, ensure_ascii=False)
-        words_param = urllib.parse.quote(words_json)
-        url = f"{GITHUB_GAME_URL}?words={words_param}"
+    words_json = json.dumps(selected_words, ensure_ascii=False)
+    words_param = urllib.parse.quote(words_json)
+    url = f"{GITHUB_GAME_URL}?words={words_param}"
 
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🎮 Играть", web_app=WebAppInfo(url=url))]
-            ]
-        )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🎮 Играть", web_app=WebAppInfo(url=url))]]
+    )
 
-        await message.answer("Запускай игру 👇", reply_markup=keyboard)
-        logger.info("Sent WebApp button for user_id=%s (words=%d)", user_id, len(words_list))
+    await message.answer(
+        f"🚀 Запускай игру!\n📚 Используются {len(selected_words)} случайных слов из твоей базы.",
+        reply_markup=keyboard
+    )
 
-    except Exception as e:
-        logger.exception("Error in /game handler for user_id=%s: %s", message.from_user.id, e)
-        await message.answer("Произошла ошибка при подготовке игры. Попробуйте позже.")
-
-# ---- тесты (как у тебя были) ----
+# ---------------- Тесты ----------------
+async def send_next_quiz(user_id):
+    words = await get_words_for_user(user_id)
+    if not words:
+        await bot.send_message(user_id, "Список слов пуст. Добавь слова через /add.")
+        active_tests.pop(user_id, None)
+        return
+    phrase, correct = random.choice(words)
+    options = [correct] + random.sample([w[1] for w in words if w[1] != correct], min(3, len(words)-1))
+    random.shuffle(options)
+    poll = await bot.send_poll(
+        chat_id=user_id,
+        question=f"Как переводится '{phrase}'?",
+        options=options,
+        type="quiz",
+        correct_option_id=options.index(correct),
+        is_anonymous=False,
+        reply_markup=stop_test_keyboard
+    )
+    current_polls[user_id] = ("test", poll.poll.id)
 
 @router.message(Command("test"))
 async def start_test(message: Message):
     user_id = message.from_user.id
-
     if user_id in active_tests:
-        await message.answer("Тест уже запущен!", reply_markup=stop_test_keyboard)
+        await message.answer("Тест уже идёт!", reply_markup=stop_test_keyboard)
         return
-
-    active_tests[user_id] = True
-    await message.answer("Тест начат! Новый вопрос отправится после вашего ответа.", reply_markup=stop_test_keyboard)
+    active_tests[user_id] = "test"
+    await message.answer("🧠 Тест начат!", reply_markup=stop_test_keyboard)
     await send_next_quiz(user_id)
 
-async def send_next_quiz(chat_id):
-    if chat_id not in active_tests:
-        return
-    words = await get_words_for_user(chat_id)
+# ---- Обратный тест ----
+async def send_next_swap_quiz(user_id):
+    words = await get_words_for_user(user_id)
     if not words:
-        await bot.send_message(chat_id, "Список слов пуст. Добавьте слова через /add.")
-        del active_tests[chat_id]
+        await bot.send_message(user_id, "Список слов пуст. Добавь слова через /add.")
+        active_tests.pop(user_id, None)
         return
-    phrase, correct_answer = random.choice(words)
-    all_translations = [w[1] for w in words if w[1] != correct_answer]
-    wrong_answers = random.sample(all_translations, min(3, len(all_translations)))
-    options = [correct_answer] + wrong_answers
+    correct, question = random.choice(words)
+    options = [correct] + random.sample([w[0] for w in words if w[0] != correct], min(3, len(words)-1))
     random.shuffle(options)
     poll = await bot.send_poll(
-        chat_id=chat_id,
-        question=f"Как переводится '{phrase}'?",
+        chat_id=user_id,
+        question=f"Что означает '{question}'?",
         options=options,
         type="quiz",
-        correct_option_id=options.index(correct_answer),
+        correct_option_id=options.index(correct),
         is_anonymous=False,
         reply_markup=stop_test_keyboard
     )
-    current_polls[chat_id] = poll.poll.id
+    current_polls[user_id] = ("swap", poll.poll.id)
 
 @router.message(Command("swap_test"))
-async def reverse_test(message: Message):
+async def swap_test(message: Message):
     user_id = message.from_user.id
-
     if user_id in active_tests:
-        await message.answer("Тест уже запущен!", reply_markup=stop_test_keyboard)
+        await message.answer("Тест уже идёт!", reply_markup=stop_test_keyboard)
         return
+    active_tests[user_id] = "swap"
+    await message.answer("🔄 Обратный тест начат!", reply_markup=stop_test_keyboard)
+    await send_next_swap_quiz(user_id)
 
-    active_tests[user_id] = True
-    await message.answer("Тест начат! Новый вопрос отправится после вашего ответа.", reply_markup=stop_test_keyboard)
-    await send_next_reverse_quiz(user_id)
-
-async def send_next_reverse_quiz(chat_id):
-    if chat_id not in active_tests:
-        return
-    words = await get_words_for_user(chat_id)
-    if not words:
-        await bot.send_message(chat_id, "Список слов пуст. Добавьте слова через /add.")
-        del active_tests[chat_id]
-        return
-    correct_answer, word = random.choice(words)
-    all_words = [w[0] for w in words if w[0] != correct_answer]
-    wrong_answers = random.sample(all_words, min(3, len(all_words)))
-    options = [correct_answer] + wrong_answers
-    random.shuffle(options)
-    poll = await bot.send_poll(
-        chat_id=chat_id,
-        question=f"Как переводится '{word}'?",
-        options=options,
-        type="quiz",
-        correct_option_id=options.index(correct_answer),
-        is_anonymous=False,
-        reply_markup=stop_test_keyboard
-    )
-    current_polls[chat_id] = poll.poll.id
-
+# ---- Ручной тест ----
 @router.message(Command("manual_test"))
 async def manual_test(message: Message):
     user_id = message.from_user.id
-
     if user_id in active_tests:
-        await message.answer("Тест уже запущен! Используйте /stop_test для остановки.", reply_markup=stop_test_keyboard)
+        await message.answer("Тест уже идёт!", reply_markup=stop_test_keyboard)
         return
-
-    words = await get_words_for_user(user_id)
-    if not words:
-        await message.answer("Список слов пуст. Добавьте слова через /add.")
-        return
-
-    active_tests[user_id] = 'manual'
+    active_tests[user_id] = "manual"
     await send_manual_question(user_id)
 
-async def send_manual_question(user_id: int):
-    if user_id not in active_tests or active_tests[user_id] != 'manual':
-        return
-
+async def send_manual_question(user_id):
     words = await get_words_for_user(user_id)
     if not words:
-        await bot.send_message(user_id, "Список слов пуст. Добавьте слова через /add.")
-        del active_tests[user_id]
+        await bot.send_message(user_id, "Список слов пуст.")
+        active_tests.pop(user_id, None)
         return
-
-    word = random.choice(words)
-    original, translation = word
-    pending_answers[user_id] = (original, translation)
-    await bot.send_message(user_id, f"Как переводится: **{original}**?", parse_mode="Markdown", reply_markup=stop_test_keyboard)
+    word, translation = random.choice(words)
+    pending_answers[user_id] = translation.lower()
+    await bot.send_message(user_id, f"✍️ Переведи: **{word}**", parse_mode="Markdown", reply_markup=stop_test_keyboard)
 
 @router.message()
-async def handle_user_translation(message: Message):
+async def handle_manual_answer(message: Message):
     user_id = message.from_user.id
-    if user_id not in active_tests or active_tests[user_id] != 'manual':
+    if user_id not in active_tests or active_tests[user_id] != "manual":
         return
-
-    user_input = message.text.strip().lower()
-    _, correct_translation = pending_answers[user_id]
-    valid_answers = [t.strip().lower() for t in correct_translation.split(',')]
-
-    if user_input in valid_answers:
+    correct = pending_answers.get(user_id, "")
+    if message.text.strip().lower() == correct:
         await message.answer("✅ Правильно!", reply_markup=stop_test_keyboard)
     else:
-        await message.answer(f"❌ Неправильно. Правильный перевод: {correct_translation}", reply_markup=stop_test_keyboard)
-
+        await message.answer(f"❌ Неправильно. Правильный ответ: {correct}", reply_markup=stop_test_keyboard)
     await send_manual_question(user_id)
 
+# ---- Ответы в опросах ----
 @router.poll_answer()
 async def poll_answer_handler(poll_answer: PollAnswer):
     user_id = poll_answer.user.id
-    if user_id in active_tests:
-        if user_id in current_polls and poll_answer.poll_id == current_polls[user_id]:
-            await send_next_quiz(user_id)
-        else:
-            await send_next_reverse_quiz(user_id)
+    if user_id not in current_polls:
+        return
+    mode, _ = current_polls[user_id]
+    if mode == "test":
+        await send_next_quiz(user_id)
+    elif mode == "swap":
+        await send_next_swap_quiz(user_id)
 
-
-
+# ---- Остановка тестов ----
 @router.message(Command("stop_test"))
 async def stop_test(message: Message):
     user_id = message.from_user.id
-    if user_id in active_tests:
-        del active_tests[user_id]
-        current_polls.pop(user_id, None)
-        pending_answers.pop(user_id, None)
-        await state.clear()
-        await message.answer("Тест остановлен.")
-    else:
-        await message.answer("Тест не был запущен.")
+    for d in (active_tests, current_polls, pending_answers):
+        d.pop(user_id, None)
+    await message.answer("⛔️ Тест остановлен.")
 
 @router.callback_query(lambda c: c.data == "stop_test")
 async def stop_test_button(callback_query):
     user_id = callback_query.from_user.id
-    if user_id in active_tests:
-        del active_tests[user_id]
-        current_polls.pop(user_id, None)
-        pending_answers.pop(user_id, None)
-        await callback_query.message.answer("Тест остановлен.")
-        await callback_query.answer()
+    for d in (active_tests, current_polls, pending_answers):
+        d.pop(user_id, None)
+    await callback_query.message.answer("⛔️ Тест остановлен.")
+    await callback_query.answer()
 
-
-
-# ------ Тестовый минимальный handler для проверки регистрации (временно/удалить later) -----
-@router.message(Command("game_test"))
-async def game_test(message: Message):
-    logger.info("game_test called for %s", message.from_user.id)
-    await message.answer("handler /game_test работает")
-
-# ---------------- include router (ВАЖНО: делать после определения всех handler'ов) ------------
+# ---------------- Запуск ----------------
 dp.include_router(router)
 
-# ---------------- commands list и запуск ----------------
 private = [
     BotCommand(command='start', description='начальная команда'),
-    BotCommand(command='test', description='Начать обычный тест'),
-    BotCommand(command='swap_test', description='Начать обратный тест'),
-    BotCommand(command='manual_test', description='Начать ручной тест'),
-    BotCommand(command='delete_all', description='Удаление всех слов'),
-    BotCommand(command='list', description='Для просмотра списока слов'),
-    BotCommand(command='game', description='Запустить мини-игру')
+    BotCommand(command='add', description='добавить слова'),
+    BotCommand(command='list', description='показать список слов'),
+    BotCommand(command='delete_all', description='удалить все слова'),
+    BotCommand(command='test', description='начать тест'),
+    BotCommand(command='swap_test', description='обратный тест'),
+    BotCommand(command='manual_test', description='ручной тест'),
+    BotCommand(command='game', description='запустить мини-игру')
 ]
 
 async def init_and_start():
